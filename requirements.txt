@@ -1,3 +1,0 @@
-datasets
-scikit-learn
-spacy
