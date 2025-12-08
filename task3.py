@@ -7,7 +7,7 @@ import evaluate
 import numpy as np
 import torch
 import torch.nn as nn
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import load_dataset
 from sklearn.metrics import classification_report
 from transformers import (
     AutoModelForSequenceClassification,
@@ -22,7 +22,6 @@ from transformers import (
 SEED = 42
 MODEL_NAME = "DeepPavlov/rubert-base-cased"
 # MODEL_NAME = "Den4ikAI/rubert-large-squad"
-# MODEL_NAME = "FacebookAI/xlm-roberta-large"
 DATASET_NAME = "Davlan/sib200"
 DATASET_LANGUAGE = "rus_Cyrl"
 MINIBATCH_SIZE = 32
@@ -51,66 +50,10 @@ def normalize_batch_texts(texts):
     return [normalize_text(text) for text in texts]
 
 
-# === Аугментации текста ===
-
-
-def split_sentences(text):
-    parts = re.split(r"([.!?])", text)
-    sents = []
-    for i in range(0, len(parts), 2):
-        seg = parts[i].strip()
-        if not seg:
-            continue
-        end = parts[i + 1] if i + 1 < len(parts) else ""
-        sents.append((seg + end).strip())
-    return [s for s in sents if s]
-
-
-def aug_sentence_shuffle(text, p=0.35):
-    if np.random.rand() > p:
-        return text
-    sents = split_sentences(text)
-    if len(sents) < 2:
-        return text
-    np.random.shuffle(sents)
-    return " ".join(sents)
-
-
-def aug_punct_swap(text, p=0.25):
-    if np.random.rand() > p:
-        return text
-    puncts = [".", ",", "!", "?"]
-    chars = list(text)
-    for i, ch in enumerate(chars):
-        if ch in puncts and np.random.rand() < 0.2:
-            chars[i] = np.random.choice(puncts)
-    return "".join(chars)
-
-
-def aug_truncate_middle(text, p=0.25):
-    if np.random.rand() > p:
-        return text
-    words = text.split()
-    n = len(words)
-    if n < 12:
-        return text
-    cut = int(n * np.random.uniform(0.1, 0.3))
-    start_keep = int((n - cut) / 2)
-    new_words = words[:start_keep] + words[start_keep + cut :]
-    return " ".join(new_words)
-
-
-def apply_augmentations(text):
-    text = aug_sentence_shuffle(text, p=0.35)
-    text = aug_punct_swap(text, p=0.25)
-    text = aug_truncate_middle(text, p=0.25)
-    return text
-
-
 # %%
 # Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-MAX_LEN = 384
+MAX_LEN = 256
 
 # %%
 # Load data
@@ -149,35 +92,10 @@ print("\nРаспределение по классам:")
 for label, count in label_counts.most_common():
     print(f"  {label}: {count} примеров ({count / len(train_labels) * 100:.2f}%)")
 
-# Балансирующее аугментирование тренировочного набора до 75-го перцентиля
-counts = collections.Counter(train_set["category"])
-if len(counts) > 0:
-    target = int(np.percentile(list(counts.values()), 80))
-    aug_texts, aug_labels = [], []
-    rng = np.random.default_rng(SEED)
-    for label in counts:
-        need = max(0, target - counts[label])
-        if need == 0:
-            continue
-        idxs = [i for i, l in enumerate(train_set["category"]) if l == label]
-        for _ in range(need):
-            i = int(rng.choice(idxs))
-            base_text = train_set[i]["text"]
-            new_text = apply_augmentations(base_text)
-            aug_texts.append(new_text)
-            aug_labels.append(label)
-    if aug_texts:
-        print(
-            f"Добавляем аугментированных примеров: {len(aug_texts)} (до баланса ~{target} на класс)"
-        )
-        aug_ds = Dataset.from_dict({"text": aug_texts, "category": aug_labels})
-        train_set = concatenate_datasets([train_set, aug_ds])
-        train_set = train_set.shuffle(seed=SEED)
-
 
 # %%
 # Вычисление весов классов
-def compute_class_weights(labels, label2id, method="sqrt"):
+def compute_class_weights(labels, label2id, method="inverse"):
     """
     Вычисление весов классов
 
@@ -263,7 +181,9 @@ label2id = dict(zip(list_of_categories, indices_of_categories))
 
 # Вычисляем веса классов ДО создания labeled наборов
 print("\nВычисление весов классов для тренировочного набора...")
-class_weights = compute_class_weights(train_set["category"], label2id, method="sqrt")
+class_weights = compute_class_weights(
+    train_set["category"], label2id, method="balanced"
+)
 
 labeled_train_set = tokenized_train_set.add_column(
     "label", [label2id[val] for val in tokenized_train_set["category"]]
@@ -314,20 +234,20 @@ classifier = AutoModelForSequenceClassification.from_pretrained(
 
 training_args = TrainingArguments(
     output_dir="rubert_sib200_weighted",
-    learning_rate=1e-4,
+    learning_rate=5e-5,
     per_device_train_batch_size=MINIBATCH_SIZE,
     per_device_eval_batch_size=MINIBATCH_SIZE,
     gradient_accumulation_steps=6,
-    num_train_epochs=10,
+    num_train_epochs=20,
     weight_decay=0.01,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_f1",
+    metric_for_best_model="eval_f1",  # Используем eval_f1, а не eval_macro_f1
     greater_is_better=True,
     logging_steps=50,
     warmup_ratio=0.1,
-    lr_scheduler_type="inverse_sqrt",
+    lr_scheduler_type="cosine",
     seed=SEED,
     data_seed=SEED,
     report_to=["none"],
