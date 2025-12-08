@@ -6,3 +6,5 @@ __pycache__/
 cache_sklearn/
 rubert_sib200/
 
+.ipynb_checkpoints/
+
