@@ -13,7 +13,6 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
-    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
     pipeline,
@@ -25,7 +24,7 @@ MODEL_NAME = "DeepPavlov/rubert-base-cased"
 # MODEL_NAME = "FacebookAI/xlm-roberta-large"
 DATASET_NAME = "Davlan/sib200"
 DATASET_LANGUAGE = "rus_Cyrl"
-MINIBATCH_SIZE = 32
+MINIBATCH_SIZE = 16
 
 
 # %%
@@ -110,7 +109,7 @@ def apply_augmentations(text):
 # %%
 # Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-MAX_LEN = 384
+MAX_LEN = 512
 
 # %%
 # Load data
@@ -149,13 +148,18 @@ print("\nРаспределение по классам:")
 for label, count in label_counts.most_common():
     print(f"  {label}: {count} примеров ({count / len(train_labels) * 100:.2f}%)")
 
-# Балансирующее аугментирование тренировочного набора до 75-го перцентиля
+# Точечное балансирующее аугментирование: усиливаем редкие классы
+# По распределению: entertainment и geography самые редкие
 counts = collections.Counter(train_set["category"])
+rare_classes = {"entertainment", "geography"}
 if len(counts) > 0:
-    target = int(np.percentile(list(counts.values()), 80))
+    # целимся подтянуть редкие классы до уровня самого частого класса
+    target = max(counts.values()) - 30
     aug_texts, aug_labels = [], []
     rng = np.random.default_rng(SEED)
     for label in counts:
+        if label not in rare_classes:
+            continue
         need = max(0, target - counts[label])
         if need == 0:
             continue
@@ -168,7 +172,7 @@ if len(counts) > 0:
             aug_labels.append(label)
     if aug_texts:
         print(
-            f"Добавляем аугментированных примеров: {len(aug_texts)} (до баланса ~{target} на класс)"
+            f"Добавляем аугментированных примеров для редких классов: {len(aug_texts)} (целевой уровень ~{target})"
         )
         aug_ds = Dataset.from_dict({"text": aug_texts, "category": aug_labels})
         train_set = concatenate_datasets([train_set, aug_ds])
@@ -178,62 +182,36 @@ if len(counts) > 0:
 # %%
 # Вычисление весов классов
 def compute_class_weights(labels, label2id, method="sqrt"):
-    """
-    Вычисление весов классов
+    counts_local = collections.Counter(labels)
+    classes_in_order = [lbl for lbl, _ in sorted(label2id.items(), key=lambda x: x[1])]
+    n_classes = len(classes_in_order)
 
-    Args:
-        labels: список меток
-        label2id: словарь соответствия меток индексам
-        method: метод вычисления весов
-            - 'balanced': обратная частота (sklearn style)
-            - 'inverse': обратные частоты
-            - 'sqrt': квадратные корни обратных частот
-    """
-    # Подсчет частот классов
-    class_counts = collections.Counter(labels)
-    n_classes = len(class_counts)
+    class_counts_by_idx = [counts_local.get(lbl, 0) for lbl in classes_in_order]
 
-    # Преобразование меток в индексы
-    label_indices = [label2id[label] for label in labels]
-
-    # Подсчет количества примеров по индексам
-    class_counts_by_idx = [0] * n_classes
-    for idx in label_indices:
-        class_counts_by_idx[idx] += 1
-
-    # Вычисление весов
     if method == "balanced":
-        # Метод из sklearn (обратная частота)
         total = sum(class_counts_by_idx)
         weights = [
-            total / (n_classes * count) if count > 0 else 1.0
-            for count in class_counts_by_idx
+            (total / (n_classes * c)) if c > 0 else 1.0 for c in class_counts_by_idx
         ]
-
     elif method == "inverse":
-        # Простые обратные частоты
-        max_count = max(class_counts_by_idx)
-        weights = [
-            max_count / count if count > 0 else 1.0 for count in class_counts_by_idx
-        ]
-
+        max_c = max(class_counts_by_idx) if any(class_counts_by_idx) else 1
+        weights = [(max_c / c) if c > 0 else 1.0 for c in class_counts_by_idx]
     elif method == "sqrt":
-        # Квадратные корни обратных частот
-        max_count = max(class_counts_by_idx)
-        weights = [
-            np.sqrt(max_count / count) if count > 0 else 1.0
-            for count in class_counts_by_idx
-        ]
-
+        max_c = max(class_counts_by_idx) if any(class_counts_by_idx) else 1
+        weights = [np.sqrt(max_c / c) if c > 0 else 1.0 for c in class_counts_by_idx]
+    elif method == "custom":
+        weights = [1.0] * n_classes
+        for i, lbl in enumerate(classes_in_order):
+            if lbl in {"entertainment", "geography"}:
+                weights[i] = 2.0
     else:
-        raise ValueError(f"Неизвестный метод: {method}")
+        raise ValueError(f"Unknown method: {method}")
 
-    # Нормализация весов
-    weights = [w / sum(weights) * n_classes for w in weights]
-
-    print(f"\nВеса классов (метод: {method}):")
-    for idx, (label, count) in enumerate(class_counts.most_common()):
-        print(f"  {label} (idx={idx}): count={count}, weight={weights[idx]:.4f}")
+    print("\nВеса классов:")
+    for i, lbl in enumerate(classes_in_order):
+        print(
+            f"  idx={i}, label={lbl}, count={class_counts_by_idx[i]}, weight={weights[i]:.4f}"
+        )
 
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -306,34 +284,35 @@ classifier = AutoModelForSequenceClassification.from_pretrained(
     num_labels=n_categories,
     id2label=id2label,
     label2id=label2id,
+    classifier_dropout=0.3,
+    hidden_dropout_prob=0.3,
+    attention_probs_dropout_prob=0.3,
 )
 
 # %%
-# Training с учетом весов классов - УПРОЩЕННАЯ ВЕРСИЯ без кастомного Trainer
-# Мы будем использовать стандартный Trainer, но с weighted loss
 
 training_args = TrainingArguments(
     output_dir="rubert_sib200_weighted",
-    learning_rate=1e-4,
+    learning_rate=2e-5,
     per_device_train_batch_size=MINIBATCH_SIZE,
     per_device_eval_batch_size=MINIBATCH_SIZE,
-    gradient_accumulation_steps=6,
-    num_train_epochs=10,
-    weight_decay=0.01,
+    gradient_accumulation_steps=2,
+    num_train_epochs=12,
+    weight_decay=0.05,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_f1",
+    metric_for_best_model="f1",
     greater_is_better=True,
     logging_steps=50,
     warmup_ratio=0.1,
-    lr_scheduler_type="inverse_sqrt",
+    lr_scheduler_type="linear",
     seed=SEED,
     data_seed=SEED,
     report_to=["none"],
     fp16=torch.cuda.is_available(),
     no_cuda=not torch.cuda.is_available(),
-    label_smoothing_factor=0.1,
+    label_smoothing_factor=0.05,
     gradient_checkpointing=True,
 )
 
@@ -364,7 +343,7 @@ trainer = WeightedLossTrainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    # callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
 
 print(f"Используется CUDA: {torch.cuda.is_available()}")
